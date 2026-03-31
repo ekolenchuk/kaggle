@@ -2,20 +2,27 @@ import os
 import glob
 import cv2
 import warnings
-
 warnings.simplefilter("ignore", UserWarning)
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.models import *
-from tensorflow.keras.layers import *
-from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+
+# Импортируем Keras напрямую, а не через TensorFlow
+import keras
+from keras.optimizers import Adam
+from keras.models import Model
+from keras.layers import (
+    Input, Conv2D, MaxPooling2D, Conv2DTranspose, 
+    concatenate, BatchNormalization, Dropout, Activation
+)
+from keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
 from matplotlib import pyplot as plt
 import keras.backend as K
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-from tensorflow.keras.utils import to_categorical
+from keras.utils import to_categorical
 import pandas as pd
+
+# Проверка версий
+print(f"Keras version: {keras.__version__}")
 
 # ============================================
 # 1. КОНФИГУРАЦИЯ
@@ -35,33 +42,32 @@ CONFIG = {
 
 # Установка seed для воспроизводимости
 np.random.seed(CONFIG["SEED"])
-tf.random.set_seed(CONFIG["SEED"])
+# tf.random.set_seed(CONFIG["SEED"])  # Закомментировано, так как используем Keras
 
 # ============================================
-# 2. УЛУЧШЕННАЯ ЗАГРУЗКА ДАННЫХ
+# 2. ЗАГРУЗКА ДАННЫХ
 # ============================================
 SIZE_X = CONFIG["IMG_SIZE"]
 SIZE_Y = CONFIG["IMG_SIZE"]
 TRAIN_PATH = CONFIG["TRAIN_PATH"]
 
-
 def load_and_preprocess_image(img_path, is_mask=False):
     """Улучшенная загрузка с нормализацией"""
     img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
-
+    
     if img is None:
         print(f"Warning: Could not read {img_path}")
         if is_mask:
             return np.zeros((SIZE_Y, SIZE_X), dtype=np.uint8)
         else:
             return np.zeros((SIZE_Y, SIZE_X, 3), dtype=np.uint8)
-
+    
     # Нормализация
     img = img.astype('float32')
     img = img - img.min()
     img = img / (img.max() + 1e-6)
     img = (img * 255).astype('uint8')
-
+    
     if not is_mask:
         if len(img.shape) == 2:
             img = np.stack([img, img, img], axis=-1)
@@ -69,9 +75,8 @@ def load_and_preprocess_image(img_path, is_mask=False):
     else:
         img = cv2.resize(img, (SIZE_Y, SIZE_X), interpolation=cv2.INTER_NEAREST)
         img = img.astype(np.uint8)
-
+    
     return img
-
 
 # Загрузка данных
 print("Загрузка данных...")
@@ -103,13 +108,13 @@ for i in range(n_samples):
     plt.subplot(2, n_samples, i + 1)
     plt.axis('off')
     plt.imshow(images[i], cmap='gray')
-    plt.title(f'Image {i + 1}')
+    plt.title(f'Image {i+1}')
 
 for i in range(n_samples):
     plt.subplot(2, n_samples, n_samples + i + 1)
     plt.axis('off')
     plt.imshow(masks[i], cmap='gray')
-    plt.title(f'Mask {i + 1}')
+    plt.title(f'Mask {i+1}')
 plt.suptitle('Original Images and Masks')
 plt.show()
 
@@ -127,7 +132,7 @@ train_masks_input = np.expand_dims(train_masks_encoded_original_shape, axis=3)
 X_train, X_val, y_train, y_val = train_test_split(
     images, train_masks_input,
     test_size=0.15,
-    shuffle=True,
+    shuffle=True, 
     random_state=CONFIG["SEED"]
 )
 
@@ -138,27 +143,24 @@ val_masks_cat = to_categorical(y_val, num_classes=CONFIG["N_CLASSES"])
 print(f'TRAIN SET: X_train shape: {X_train.shape}, y_train shape: {train_masks_cat.shape}')
 print(f'VALIDATION SET: X_val shape: {X_val.shape}, y_val shape: {val_masks_cat.shape}')
 
-
 # ============================================
-# 5. УЛУЧШЕННАЯ АРХИТЕКТУРА U-NET
+# 5. АРХИТЕКТУРА U-NET
 # ============================================
 def double_conv_block(x, n_filters, dropout_rate=0.1):
     x = Conv2D(n_filters, 3, padding="same", kernel_initializer="he_normal")(x)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
     x = Dropout(dropout_rate)(x)
-
+    
     x = Conv2D(n_filters, 3, padding="same", kernel_initializer="he_normal")(x)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
     return x
 
-
 def downsample_block(x, n_filters, dropout_rate=0.1):
     f = double_conv_block(x, n_filters, dropout_rate)
-    p = MaxPool2D(2)(f)
+    p = MaxPooling2D(2)(f)
     return f, p
-
 
 def upsample_block(x, conv_features, n_filters, dropout_rate=0.1):
     x = Conv2DTranspose(n_filters, 3, 2, padding="same")(x)
@@ -166,31 +168,29 @@ def upsample_block(x, conv_features, n_filters, dropout_rate=0.1):
     x = double_conv_block(x, n_filters, dropout_rate)
     return x
 
-
 def build_improved_unet(img_size, num_classes):
     inputs = Input(shape=img_size)
-
+    
     # Encoder
     f1, p1 = downsample_block(inputs, 64, dropout_rate=0.1)
     f2, p2 = downsample_block(p1, 128, dropout_rate=0.1)
     f3, p3 = downsample_block(p2, 256, dropout_rate=0.2)
     f4, p4 = downsample_block(p3, 512, dropout_rate=0.2)
-
+    
     # Bottleneck
     bottleneck = double_conv_block(p4, 1024, dropout_rate=0.3)
-
+    
     # Decoder
     u6 = upsample_block(bottleneck, f4, 512, dropout_rate=0.2)
     u7 = upsample_block(u6, f3, 256, dropout_rate=0.2)
     u8 = upsample_block(u7, f2, 128, dropout_rate=0.1)
     u9 = upsample_block(u8, f1, 64, dropout_rate=0.1)
-
+    
     # Output
     outputs = Conv2D(num_classes, 1, padding="same", activation='softmax')(u9)
-
-    model = tf.keras.Model(inputs, outputs, name="Improved_U-Net")
+    
+    model = Model(inputs, outputs, name="Improved_U-Net")
     return model
-
 
 # ============================================
 # 6. ФУНКЦИЯ ПОТЕРЬ
@@ -202,20 +202,17 @@ def dice_loss(y_true, y_pred, smooth=1e-6):
     dice = (2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth)
     return 1 - dice
 
-
 def combined_loss(y_true, y_pred):
-    bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
+    bce = keras.losses.binary_crossentropy(y_true, y_pred)
     dice = dice_loss(y_true, y_pred)
     return bce + dice
 
-
 def dice_coef(y_true, y_pred, smooth=1.0):
-    y_true_f = tf.reshape(y_true[:, :, :, 1], [-1])
-    y_pred_f = tf.reshape(y_pred[:, :, :, 1], [-1])
-    intersection = tf.reduce_sum(y_true_f * y_pred_f)
-    dice = (2. * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
+    y_true_f = K.reshape(y_true[:,:,:,1], [-1])
+    y_pred_f = K.reshape(y_pred[:,:,:,1], [-1])
+    intersection = K.sum(y_true_f * y_pred_f)
+    dice = (2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth)
     return dice
-
 
 # ============================================
 # 7. СОЗДАНИЕ И КОМПИЛЯЦИЯ МОДЕЛИ
@@ -231,7 +228,7 @@ improved_model.compile(
 )
 
 # ============================================
-# 8. CALLBACKS (адаптированы под 20 эпох)
+# 8. CALLBACKS
 # ============================================
 earlystopper = EarlyStopping(
     monitor='val_loss',
@@ -258,11 +255,11 @@ reduce_lr = ReduceLROnPlateau(
 callbacks = [earlystopper, checkpointer, reduce_lr]
 
 # ============================================
-# 9. ОБУЧЕНИЕ (20 эпох)
+# 9. ОБУЧЕНИЕ
 # ============================================
-print("\n" + "=" * 60)
+print("\n" + "="*60)
 print(f"НАЧАЛО ОБУЧЕНИЯ НА {CONFIG['EPOCHS']} ЭПОХ")
-print("=" * 60)
+print("="*60)
 
 history = improved_model.fit(
     X_train, train_masks_cat,
@@ -275,7 +272,7 @@ history = improved_model.fit(
 )
 
 # ============================================
-# 10. ВИЗУАЛИЗАЦИЯ РЕЗУЛЬТАТОВ ОБУЧЕНИЯ
+# 10. ВИЗУАЛИЗАЦИЯ РЕЗУЛЬТАТОВ
 # ============================================
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -301,94 +298,16 @@ plt.show()
 # ============================================
 # 11. ВЫВОД РЕЗУЛЬТАТОВ
 # ============================================
-print("\n" + "=" * 60)
-print("РЕЗУЛЬТАТЫ ОБУЧЕНИЯ (20 эпох):")
-print("=" * 60)
+print("\n" + "="*60)
+print("РЕЗУЛЬТАТЫ ОБУЧЕНИЯ:")
+print("="*60)
 print(f"Лучшая Dice Score на обучении: {max(history.history['dice_coef']):.4f}")
 print(f"Лучшая Dice Score на валидации: {max(history.history['val_dice_coef']):.4f}")
-print(f"Финальная Dice Score на обучении: {history.history['dice_coef'][-1]:.4f}")
-print(f"Финальная Dice Score на валидации: {history.history['val_dice_coef'][-1]:.4f}")
 
-# Оценка модели
-test_results = improved_model.evaluate(X_val, val_masks_cat, batch_size=CONFIG["BATCH_SIZE"], verbose=0)
-print(f"\nОценка на валидации - Loss: {test_results[0]:.4f}, Dice: {test_results[1]:.4f}")
+# Сохранение модели
+improved_model.save('improved_liver_segmentation.h5')
+print("✅ Модель сохранена как 'improved_liver_segmentation.h5'")
 
-# ============================================
-# 12. ЗАГРУЗКА ТЕСТОВЫХ ИЗОБРАЖЕНИЙ
-# ============================================
-print("\nЗагрузка тестовых изображений...")
-test_images = []
-
-for directory_path in sorted(glob.glob(TRAIN_PATH + '/test_image/')):
-    for img_path in sorted(glob.glob(os.path.join(directory_path, "*.tiff"))):
-        img = load_and_preprocess_image(img_path, is_mask=False)
-        test_images.append(img)
-
-test_images = np.array(test_images)
-print(f'Test images shape: {test_images.shape}')
-
-# Сегментация
-print("Выполнение сегментации...")
-predictions = []
-for i in range(len(test_images)):
-    test_img = test_images[i]
-    test_img_input = np.expand_dims(test_img, 0)
-    test_pred = improved_model.predict(test_img_input, verbose=0)
-    test_prediction = np.argmax(test_pred, axis=3)[0, :, :]
-    predictions.append(test_prediction)
-
-# Визуализация результатов
-from random import randint
-
-n_test_samples = 3
-fig, axes = plt.subplots(n_test_samples, 3, figsize=(12, 10))
-
-for i in range(n_test_samples):
-    test_idx = randint(0, len(test_images) - 1)
-
-    axes[i, 0].imshow(test_images[test_idx][:, :, 0], cmap='gray')
-    axes[i, 0].set_title(f'Original Image {i + 1}')
-    axes[i, 0].axis('off')
-
-    axes[i, 1].imshow(predictions[test_idx], cmap='gray')
-    axes[i, 1].set_title(f'Predicted Mask')
-    axes[i, 1].axis('off')
-
-    # Overlay
-    overlay = test_images[test_idx][:, :, 0].copy()
-    overlay[predictions[test_idx] == 1] = 255
-    axes[i, 2].imshow(overlay, cmap='gray')
-    axes[i, 2].set_title(f'Overlay')
-    axes[i, 2].axis('off')
-
-plt.tight_layout()
-plt.show()
-
-
-# ============================================
-# 13. СОЗДАНИЕ SUBMISSION.CSV
-# ============================================
-def encode_mask_to_rle(mask):
-    pixels = mask.flatten()
-    pixels = np.concatenate([[0], pixels, [0]])
-    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
-    runs[1::2] -= runs[::2]
-    return ' '.join(str(x) for x in runs)
-
-
-print("\nСоздание submission.csv...")
-rle_predictions = []
-for i in range(len(predictions)):
-    encoded = encode_mask_to_rle(predictions[i])
-    rle_predictions.append(encoded)
-
-submission = pd.DataFrame(data={'id': range(len(rle_predictions)), 'target': rle_predictions})
-submission.to_csv('submission.csv', index=False)
-print(f"submission.csv создан, записей: {len(submission)}")
-print(submission.head())
-
-# ============================================
-# 14. СОХРАНЕНИЕ МОДЕЛИ
-# ============================================
-improved_model.save('improved_liver_segmentation_20epochs.h5')
-print("Модель сохранена как 'improved_liver_segmentation_20epochs.h5'")
+print("\n" + "="*60)
+print("ОБУЧЕНИЕ УСПЕШНО ЗАВЕРШЕНО!")
+print("="*60)
