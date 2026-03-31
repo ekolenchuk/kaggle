@@ -5,7 +5,7 @@ import warnings
 warnings.simplefilter("ignore", UserWarning)
 import numpy as np
 
-# Импортируем Keras напрямую, а не через TensorFlow
+# Импортируем Keras напрямую
 import keras
 from keras.optimizers import Adam
 from keras.models import Model
@@ -20,9 +20,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from keras.utils import to_categorical
 import pandas as pd
-
-# Проверка версий
-print(f"Keras version: {keras.__version__}")
+import tensorflow as tf
 
 # ============================================
 # 1. КОНФИГУРАЦИЯ
@@ -42,7 +40,6 @@ CONFIG = {
 
 # Установка seed для воспроизводимости
 np.random.seed(CONFIG["SEED"])
-# tf.random.set_seed(CONFIG["SEED"])  # Закомментировано, так как используем Keras
 
 # ============================================
 # 2. ЗАГРУЗКА ДАННЫХ
@@ -193,13 +190,14 @@ def build_improved_unet(img_size, num_classes):
     return model
 
 # ============================================
-# 6. ФУНКЦИЯ ПОТЕРЬ
+# 6. ФУНКЦИЯ ПОТЕРЬ (ИСПРАВЛЕННАЯ)
 # ============================================
 def dice_loss(y_true, y_pred, smooth=1e-6):
-    y_true_f = K.flatten(y_true)
-    y_pred_f = K.flatten(y_pred)
-    intersection = K.sum(y_true_f * y_pred_f)
-    dice = (2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth)
+    # Используем tf.keras.backend.flatten вместо K.flatten
+    y_true_f = tf.keras.backend.flatten(y_true)
+    y_pred_f = tf.keras.backend.flatten(y_pred)
+    intersection = tf.keras.backend.sum(y_true_f * y_pred_f)
+    dice = (2. * intersection + smooth) / (tf.keras.backend.sum(y_true_f) + tf.keras.backend.sum(y_pred_f) + smooth)
     return 1 - dice
 
 def combined_loss(y_true, y_pred):
@@ -208,10 +206,12 @@ def combined_loss(y_true, y_pred):
     return bce + dice
 
 def dice_coef(y_true, y_pred, smooth=1.0):
-    y_true_f = K.reshape(y_true[:,:,:,1], [-1])
-    y_pred_f = K.reshape(y_pred[:,:,:,1], [-1])
-    intersection = K.sum(y_true_f * y_pred_f)
-    dice = (2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth)
+    # Исправленная версия dice_coef
+    # Получаем маски для класса 1 (печень)
+    y_true_f = tf.keras.backend.flatten(y_true[:,:,:,1])
+    y_pred_f = tf.keras.backend.flatten(y_pred[:,:,:,1])
+    intersection = tf.keras.backend.sum(y_true_f * y_pred_f)
+    dice = (2. * intersection + smooth) / (tf.keras.backend.sum(y_true_f) + tf.keras.backend.sum(y_pred_f) + smooth)
     return dice
 
 # ============================================
@@ -303,8 +303,87 @@ print("РЕЗУЛЬТАТЫ ОБУЧЕНИЯ:")
 print("="*60)
 print(f"Лучшая Dice Score на обучении: {max(history.history['dice_coef']):.4f}")
 print(f"Лучшая Dice Score на валидации: {max(history.history['val_dice_coef']):.4f}")
+print(f"Финальная потеря на обучении: {history.history['loss'][-1]:.4f}")
+print(f"Финальная потеря на валидации: {history.history['val_loss'][-1]:.4f}")
 
-# Сохранение модели
+# Оценка модели
+test_results = improved_model.evaluate(X_val, val_masks_cat, batch_size=CONFIG["BATCH_SIZE"], verbose=0)
+print(f"\nОценка на валидации - Loss: {test_results[0]:.4f}, Dice: {test_results[1]:.4f}")
+
+# ============================================
+# 12. ЗАГРУЗКА ТЕСТОВЫХ ИЗОБРАЖЕНИЙ
+# ============================================
+print("\nЗагрузка тестовых изображений...")
+test_images = []
+
+for directory_path in sorted(glob.glob(TRAIN_PATH + '/test_image/')):
+    for img_path in sorted(glob.glob(os.path.join(directory_path, "*.tiff"))):
+        img = load_and_preprocess_image(img_path, is_mask=False)
+        test_images.append(img)
+
+test_images = np.array(test_images)
+print(f'Test images shape: {test_images.shape}')
+
+# Сегментация
+print("Выполнение сегментации...")
+predictions = []
+for i in range(len(test_images)):
+    test_img = test_images[i]
+    test_img_input = np.expand_dims(test_img, 0)
+    test_pred = improved_model.predict(test_img_input, verbose=0)
+    test_prediction = np.argmax(test_pred, axis=3)[0, :, :]
+    predictions.append(test_prediction)
+
+# Визуализация результатов
+from random import randint
+n_test_samples = 3
+fig, axes = plt.subplots(n_test_samples, 3, figsize=(12, 10))
+
+for i in range(n_test_samples):
+    test_idx = randint(0, len(test_images) - 1)
+    
+    axes[i, 0].imshow(test_images[test_idx][:, :, 0], cmap='gray')
+    axes[i, 0].set_title(f'Original Image {i+1}')
+    axes[i, 0].axis('off')
+    
+    axes[i, 1].imshow(predictions[test_idx], cmap='gray')
+    axes[i, 1].set_title(f'Predicted Mask')
+    axes[i, 1].axis('off')
+    
+    # Overlay
+    overlay = test_images[test_idx][:, :, 0].copy()
+    overlay[predictions[test_idx] == 1] = 255
+    axes[i, 2].imshow(overlay, cmap='gray')
+    axes[i, 2].set_title(f'Overlay')
+    axes[i, 2].axis('off')
+
+plt.tight_layout()
+plt.show()
+
+# ============================================
+# 13. СОЗДАНИЕ SUBMISSION.CSV
+# ============================================
+def encode_mask_to_rle(mask):
+    pixels = mask.flatten()
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[::2]
+    return ' '.join(str(x) for x in runs)
+
+print("\nСоздание submission.csv...")
+rle_predictions = []
+for i in range(len(predictions)):
+    encoded = encode_mask_to_rle(predictions[i])
+    rle_predictions.append(encoded)
+
+submission = pd.DataFrame(data={'id': range(len(rle_predictions)), 'target': rle_predictions})
+submission.to_csv('submission.csv', index=False)
+print(f"✅ submission.csv создан, записей: {len(submission)}")
+print(submission.head())
+
+# ============================================
+# 14. СОХРАНЕНИЕ МОДЕЛИ
+# ============================================
 improved_model.save('improved_liver_segmentation.h5')
 print("✅ Модель сохранена как 'improved_liver_segmentation.h5'")
 
